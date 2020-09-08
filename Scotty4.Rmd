@@ -1,0 +1,712 @@
+---
+title: "Forecasting of Demand for Ride Sharing (Study Case - Scotty Dataset)"
+author: "Meinari"
+date: "3/28/2020"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: 
+        collapsed: false
+    number_sections: true
+    fig_caption: yes
+    df_print : paged 
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(scipen = 9999)
+rm(list=ls())
+```
+
+# Introduction
+
+![](scotty.jpg)
+
+**Scotty** is a ride-sharing business that operating in several big cities in Turkey. The company provide motorcycles  ride-sharing service for Turkey's citizen, and really value the efficiency in traveling through the traffic. 
+  
+Scotty provides customer with real-time transaction dataset. With this dataset, we are going to help them in solving some forecasting and classification problems in order to improve their business processes. 
+
+## Business Question
+In this analysis we build forecast model to help Scotty ready for the end of 2017 demands. Unfortunately, Scotty is not old enough to have last year data for December, so we can not look back at past demands to prepare forecast for December's demands. As an investment for the business' future, we need to develop an automated forecasting framework so we don't have to meddling with forecast model selection anymore in the future.  
+**Build an automated forecasting model for hourly demands that would be evaluated on the next 7 days (Sunday, December 3rd 2017, to Monday, December 9th 2017)!**  
+This analysis is to forecast hourly demand of scotty in 3 areas. 
+
+
+# Basic Concept : Time Series
+## Time Series
+**Time series** is a method of analyzing and processing data which the values are affected by time. The action of predicting future values based on its value in the previous period of time is called **forecasting**. 
+The data which formatted into a time series (ts) object must have some charactersitics:  
+* no missing intervals  
+* no missing values  
+* data should be ordered by time
+
+## Exploratory Data Analysis (EDA)
+A ts object can be decomposed into 3 *main components* which will be calculated for forecasting. These components are :  
+- **trend (T)** : the movement of mean, globally,throughout an interval  
+- **seasonal (S)** : the pattern captured on each seasonal interval  
+- **error (E)** : the pattern /value that cannot be captured by both trend and seasonal.
+
+# Solution
+## Import Library
+
+```{r}
+library(readr) #to read data
+library(DT) #to visualize data in table
+library(lubridate) #to dea with data
+library(tidyverse) #for data wrangling 
+library(dplyr) #for data wrangling
+library(ggplot2) #for basic EDA
+library(TSstudio) #time series library
+library(padr) # for padding
+library(forecast) # for forecasting
+library(tseries) # for adf.test
+library(MLmetrics)#for calculating error
+library(yardstick) #for measuing forecast performance
+library(purrr) #for functional programming
+library(tidyquant) #for some ggplot aesthetic
+library(recipes) #for data preprocess
+library(zoo) #for fill NA data
+library(tidyr) #for function spread/nest
+library(recipes) #for function ts and msts
+library(tibble) #for function enframe
+library(tidymodels) #for function rmse_vec
+library(png) #for function readPNG
+library(grid) #for function grid.raster
+library(plotly) #for plotly
+```
+
+## Read Data
+```{r}
+scotty <- read_csv("data-train.csv")
+```
+
+## Data Preparation
+```{r}
+colSums(is.na(scotty))
+```
+
+The main variable of this research are **`src_sub_area`** (area/location where the cutomers request for ride) and **`start_time`** (time where the customers make request for the ride). And there are no *missing value* of those variables, so we can proceed to the next step.
+
+## Data Preprocess
+```{r}
+#check structure of the data
+str(scotty)
+```
+
+### Data Aggregation
+
+1. Since we want to forecast total demand per hour so we need to floor the date into specific time, in this case to *hour*.  
+2. We also need to summarize the total demand/order per hour using count `n()`.
+3. It is compulsary to have full and continuous data based on series (hour) therefore we need to do `padding` 
+4. Fill value of total_order with `0` when there is no demand/order in that time.
+
+```{r}
+# Data Aggregation and Padding
+scotty_agg <- scotty %>% 
+    mutate(datetime = floor_date(start_time, unit = "hours")) %>% #1
+    group_by(src_sub_area, datetime) %>% 
+    summarise(demand = n()) %>% #2
+    pad() %>% #3
+    fill_by_value(demand, value = 0) %>% #4
+    ungroup()
+```
+
+
+#### To visualize total order of scotty based on area :
+```{r}
+plot1 <- ggplot(data = scotty_agg, aes(x=datetime, y=demand))+
+  geom_line()+
+  labs(x = NULL, Y = NULL)+
+  facet_wrap(~ src_sub_area, scale ="free", ncol=1)+
+  tidyquant::theme_tq()
+
+plot1
+```
+
+
+```{r}
+#check the range of the data
+range(scotty_agg$datetime)
+```
+The series data start from **2017-10-01 00:00:00 UTC** until **2017-12-02 23:00:00 UTC**
+
+## Cross Validation Scheme
+In this step we need to the following steps as followed :  
+1. Splitting data into data training and validation data set.
+
+### Splitting Data
+In this splitting data, we do not use rolling origin method, we use latest 7 days data series for data validation by the source area. It is because this analysis' purpose is to forecast total demand for 7 days.
+
+```{r}
+# train-test-size
+test_size <- 24*7 # the total of data validation is one week (7 days) since the real data test to predict is 7 days also
+train_size <- nrow(scotty_agg)/3 - test_size
+
+# get the min-max of the time index for each sample
+test_end <- max(scotty_agg$datetime)
+test_start <- test_end - hours(test_size) + hours(1)
+
+train_end <- test_start - hours(1)
+train_start <- train_end - hours(train_size) + hours(1)
+```
+
+To make it more handy, I combined the start and end indices into a date interval :
+```{r}
+# get the interval of each samples
+intrain <- interval(train_start, train_end)
+intest <- interval(test_start, test_end)
+
+intrain
+intest
+```
+
+Visualize the *train* and *test* series using interval
+```{r}
+# plot the train and test
+scotty_agg %>% 
+  mutate(sample = case_when(
+    datetime %within% intrain ~ "train",
+    datetime %within% intest ~ "test"
+  )) %>% 
+  drop_na() %>% 
+  mutate(sample = factor(sample, levels = c("train","test"))) %>% 
+  ggplot(aes(x=datetime, y = demand, color = sample)) +
+    geom_line()+
+    labs(x=NULL, y=NULL, color = NULL)+
+    facet_wrap(~ src_sub_area, scale = "free", ncol =1)+
+    tidyquant::theme_tq()+
+    tidyquant::scale_colour_tq()
+```
+
+## Data Processing
+Data processing is a very crucial step in time series model fitting. In this tutorial, I will use `recipes` package for data preprocessing.  
+Since recipes package work columnwise, we need to convert our data into a wide format first :
+```{r}
+#converting to wide format
+scotty_agg <- scotty_agg %>% 
+  spread(src_sub_area, demand)
+```
+
+Then we could start to define the preprocess `recipe()`, and `bake()` our data based on the defined recipe :
+```{r}
+# recipes : 
+scotty_recipe <- recipe(formula = ~.,
+                        data = scotty_agg) %>% 
+  #step
+  step_scale(all_numeric()) %>% #do scaling
+  #prep
+  prep()
+
+# preview the bake results
+scotty1 <- bake(scotty_recipe,scotty_agg)
+```
+
+**Note** : When we use `recipes` package, the next steps is to create a revert back function:
+```{r}
+#revert back function
+scotty_recipe_revert <- function(vector, recipe, varname){
+  
+  #store recipe values
+  results <- recipe$steps[[1]]$sds[varname]*vector
+  
+  #add additional adjustment if necessary
+  results <- round(results)
+  
+  #return the results
+  results
+}
+```
+
+Now we can convert our data into the long format again :
+
+```{r}
+#convert back to long format
+scotty1 <- scotty1 %>% 
+  gather(src_sub_area, demand, -datetime)
+```
+
+Adding one new variable `sample` to differ data-train and data-test:
+```{r}
+scotty1 <- scotty1 %>% 
+  mutate(sample = case_when(
+    datetime %within% intrain ~ "train",
+    datetime %within% intest ~ "test"
+  ))
+```
+
+Creating list data based on sub area. In the next process it will be divided into data-train and data-test:
+```{r}
+scotty_nest <- scotty1 %>% 
+  group_by(src_sub_area, sample) %>% 
+  nest(.key= "data") %>% 
+  pivot_wider(names_from = sample, values_from = data)
+```
+
+To convert our data into  *time series* format `ts()` or `msts()`. So in this step we will make list data function named `ts_function_list` that consist of those functions, in which for *time series* we will use seasonality as following :  
+- `ts` for single seasonality, will use daily seasonality (frequency = 24)  
+- `msts` for multiple or complex seasonality, will use daily seasonality (frequency = 24) and weekly (frequency = 24*7)
+
+```{r}
+# list function that will be used to creat timse series format data
+ts_function_list <- list(
+  ts = function(x) ts(x$demand, frequency = 24),
+  msts = function(x) msts(x$demand, seasonal.periods = c(24, 24*7))
+)
+
+# combining ts_function_list with each sub area
+ts_function_list <- ts_function_list %>% 
+  rep(length(unique(scotty_nest$src_sub_area))) %>% 
+  enframe("func_name", "func") %>% 
+  mutate(
+    src_sub_area = sort(rep(unique(scotty_nest$src_sub_area), length(unique(.$func_name))))
+  )
+```
+
+At the end, grouping `ts_function_list` to `scotty_nest` :
+```{r}
+scotty_nest <- scotty_nest %>% 
+  left_join(ts_function_list)
+```
+
+# Modelling Using Data Train
+
+## Make list *time series model*
+To make model for time series format data, we will make list model named `model_function_list` that contained functions to do *time series* model fitting.
+```{r}
+#list model that will be used in fitting model
+model_function_list <- list(
+  ets = function(x) ets(x),
+  auto.arima = function(x) auto.arima(x),
+  stlm = function(x) stlm(x),
+  tbats = function(x) tbats(x, use.box.cox = FALSE)
+)
+
+#Combining model_function_list with each sub area
+model_function_list <- model_function_list %>% 
+  rep(length(unique(scotty_nest$src_sub_area))) %>% 
+  enframe("model_name", "model") %>% 
+  mutate(src_sub_area =
+           sort(rep(unique(scotty_nest$src_sub_area), length(unique(.$model_name)))))
+```
+
+The next step is to combine `model_funtion_list` to `scotty_nest`. Since model `ets` and `auto.arima` cannot be applied for multiseasonal time series type, therefore we would not combine them with `msts` time series:
+```{r}
+scotty_nest <- scotty_nest %>% 
+  left_join(model_function_list) %>% 
+  filter(
+    !(model_name == "ets" & func_name == "msts"),
+    !(model_name == "auto.arima" & func_name == "msts")
+  )
+```
+
+
+## Modelling
+To run data in `scotty_nest` based on function and model that contained in that dataframe. First stage is running function to create `time series` data based on variable `func` then create model based on variable `model` in which the result will be restored to variable `fitted` :
+
+```{r}
+scotty_nest <- scotty_nest %>% 
+  mutate(
+    params = map(train, ~ list(x=.x)),
+    data = invoke_map(func, params),
+    params = map(data, ~list(x=.x)),
+    fitted = invoke_map(model,params)
+  ) %>% 
+  select(-data, -params)
+```
+
+## Compare to Data Test
+After we did modelling, here we will extract our error value if the model apply to our Data-test:
+```{r}
+scotty_nest <- scotty_nest %>% 
+  mutate(
+    error = map(fitted, ~ forecast(.x, h =24*7)) %>% 
+            map2_dbl(test, ~ rmse_vec(truth = .y$demand, estimate = .x$mean))
+  ) %>% 
+  arrange(src_sub_area, error)
+```
+
+Next we will plot our data forecast to compare our data forecast and data-val.
+```{r}
+scotty_test <- scotty_nest %>% 
+  mutate(
+    forecast = map(fitted, ~ forecast(.x, h=24*7)) %>%
+               map2(test, ~tibble(datetime = .y$datetime, demand = as.vector(.x$mean))),
+    key = paste(func_name, model_name, sep="-"))
+```
+
+Next, we will convert our data that was in column format into row format :
+```{r}
+scotty_test <- scotty_test %>% 
+  select(src_sub_area, key, actual = test, forecast) %>% 
+  spread(key, forecast) %>% 
+  gather(key, value, -src_sub_area)
+```
+
+Since our forecast result is still in `scotty_recipe` function, therefore we need to convert the origini value using function `scotty_recipe_revert`.
+```{r}
+scotty_test <- scotty_test %>% 
+  unnest(value) %>% 
+  mutate(demand = scotty_recipe_revert(demand, scotty_recipe,src_sub_area))
+```
+
+To visualize forecast result and data val in plot :
+```{r}
+scotty_test %>% 
+  ggplot(aes(x=datetime, y=demand, colour = key))+
+    geom_line()+
+    labs(x=NULL, y=NULL, colour = NULL)+
+    facet_wrap(~src_sub_area, scale = "free", ncol =1)+
+    theme_light()+
+    tidyquant::scale_colour_tq()
+```
+### Comparing The Result
+```{r}
+plot_compare <- scotty_test %>% 
+  ggplot(aes(x = datetime, y = demand, colour = key))+
+  geom_line(data = scotty_test %>% 
+              filter(key == "actual"), aes(y=demand), alpha = 0.3, size = 0.8)+
+  geom_line(data = scotty_test %>% 
+              filter(key != "actual"), aes(frame = key, col = key))+
+  labs(x="", y = "Demand", title = "Model Prediction Comparison", frame = "Model")+
+  facet_wrap(~ src_sub_area, scale = "free_y", ncol =1)+
+  tidyquant::theme_tq()+
+  theme(legend.position = "none", axis.title.y = element_text(size =12), axis.text.y = element_text(size =7))
+
+ggplotly(plot_compare)
+```
+
+## Automated Model Selection
+Based on model have been built before, we will take model with has lowest error value based on sub area using following steps:
+```{r}
+scotty_model_selected <- scotty_nest %>% 
+  group_by(src_sub_area) %>% 
+  filter(error == min(error)) %>% 
+  ungroup()
+```
+
+Evaluate model using `MAE` to data test :
+```{r}
+scotty_mae <- scotty_test %>% 
+  filter(
+    paste(key,src_sub_area, sep = "-")%in%
+      paste(scotty_model_selected$func_name,
+            scotty_model_selected$model_name,
+            scotty_model_selected$src_sub_area,
+            sep = "-")
+    | key == "actual"
+  ) %>% 
+  mutate(
+    demand = as.numeric(demand),
+    key = if_else(key == "actual", "actual", "forecast")
+  ) %>% 
+  spread(key, demand)
+
+# MAE per sub area
+scotty_mae_by_src_sub_area <- scotty_mae %>% 
+  group_by(src_sub_area) %>% 
+  nest() %>% 
+  mutate(
+    tmp = map(data, ~invoke_map_dfc(list(mae=mae_vec),
+                                    truth = .x$actual, estimate =.x$forecast))
+  ) %>% 
+  select(-data) %>% 
+  unnest() %>% 
+  ungroup() %>% 
+  add_row(src_sub_area = "all_sub_area",
+          mae = MLmetrics::MAE(scotty_mae$forecast, scotty_mae$actual)) %>% 
+  mutate(
+    mae = round(mae,4)
+  )
+```
+
+# Improving Model
+Here we do model improvement in our data pre-processing. In our function `scotty_recipe` where we only do data scalling, here we try to make new function `scotty_rec_imp` as following process :  
+- square  
+- mean  
+
+```{r}
+scotty_rec_imp <- recipe(formula = ~.,
+                         data = scotty_agg) %>% 
+  #step
+  step_sqrt(all_numeric()) %>% #squarring
+  step_center(all_numeric()) %>%  #mean subtraction
+  step_scale(all_numeric()) %>%  #do scalling
+  #prep
+  prep()
+```
+
+Next, we do implementation `scotty_rec_imp` to data `scotty_agg` we use `bake()` function :
+```{r}
+scotty2 <- bake(scotty_rec_imp, scotty_agg)
+```
+
+After we do data manipulation, we have to revert out data value to origin value in function `scotty_rec_imp_rev` :
+
+```{r}
+scotty_rec_imp_rev <- function(vector, recipe, varname){
+  #store recipe values
+  recipe_center <- recipe$steps[[2]]$means[varname]
+  recipe_scale <- recipe$steps[[3]]$sds[varname]
+  
+  #convert back based on the recipe
+  results <- (vector * recipe_scale + recipe_center)^2
+  
+  #add additional adjustment if necessary
+  results <- round(results)
+  
+  #return the results
+  results
+}
+```
+
+Next we convert our data to row-form using function `gather()` and create new variable `sample` to differ data train and data test :
+```{r}
+scotty2 <- scotty2 %>% 
+  gather(src_sub_area, demand, -datetime) %>% 
+  mutate(sample = case_when(
+    datetime %within% intrain ~ "train",
+    datetime %within% intest ~ "test"
+  ))
+```
+
+Next, we make data list based on sub area. Then it will be divided into train and test:
+```{r}
+scotty_nest_imp <- scotty2 %>% 
+  group_by(src_sub_area, sample) %>% 
+  nest(.key = "data") %>% 
+  pivot_wider(names_from = sample, values_from = data)
+```
+
+Next, we will combine function `ts_function_list` (contained list function of time series) that we made before using data `scotty_nest_imp` :
+```{r}
+scotty_nest_imp <- scotty_nest_imp %>%
+  left_join(ts_function_list)
+```
+
+Next step we combine `model_function_list1` to data `scotty_nest_imp` :
+```{r}
+scotty_nest_imp <- scotty_nest_imp %>% 
+  left_join(model_function_list) %>% 
+  filter(
+    !(model_name == "ets" & func_name == "msts"),
+    !(model_name == "auto.arima" & func_name == "msts")
+  )
+```
+
+Next, we run all data in `scotty_nest_imp` to function and model in that data the the result we stored to variable `fitted` :
+```{r}
+scotty_nest_imp <- scotty_nest_imp %>% 
+  mutate(
+    params = map(train, ~ list(x=.x)),
+    data = invoke_map(func, params),
+    params = map(data, ~ list(x=.x)),
+    fitted = invoke_map(model, params)
+  ) %>% 
+  select(-data, -params)
+```
+
+Then, from models we make before, we take model with has lowest error value based on sub area with following steps :
+```{r}
+scotty_model_imp_sel <- scotty_nest_imp %>% 
+  #check error when it's implemented to data val
+  mutate(
+    error = map(fitted, ~ forecast(.x, h = 24*7)) %>% 
+          map2_dbl(test, ~rmse_vec(truth = .y$demand, estimate = .x$mean))
+  ) %>% 
+  arrange(src_sub_area, error) %>% 
+  # take model with lowest error value
+  group_by(src_sub_area) %>%
+  filter(error == min(error)) %>%
+  ungroup()
+```
+
+Implement to **data test**, the MAE value is as followed :
+```{r}
+scotty_mae_imp <- scotty_model_imp_sel %>% 
+  # calculating forecast value based on the data val
+  mutate(
+    forecast = map(fitted, ~ forecast(.x, h=24*7)) %>% 
+               map2(test, ~ tibble(datetime = .y$datetime, demand = as.vector(.x$mean))),
+    key = paste(func_name, model_name, sep = "-")
+  ) %>% 
+  # Converting column-format-data to row-format-data
+  select(src_sub_area, key, actual = test, forecast) %>% 
+  spread(key, forecast) %>% 
+  gather(key, value, -src_sub_area) %>% 
+  # restore origin value using `scotty_rec_imp_rev`
+  unnest(value) %>% 
+  mutate(demand = scotty_rec_imp_rev(demand, scotty_rec_imp, src_sub_area)) %>%   
+  # comparing model that has lowest value error
+  filter(
+    paste(key, src_sub_area, sep = "-")%in%
+      paste(scotty_model_imp_sel$func_name,
+            scotty_model_imp_sel$model_name,
+            scotty_model_imp_sel$src_sub_area,
+            sep="-")
+    | key == "actual"
+  ) %>%
+  mutate(
+    demand = as.numeric(demand),
+    key = if_else(key == "actual", "actual", "forecast")
+  ) %>%
+  spread(key, demand)
+
+scotty_mae_imp_by_src_sub_area <- scotty_mae_imp %>% 
+  #calculating MAE per sub area
+  group_by(src_sub_area) %>% 
+  nest() %>% 
+  mutate(
+    tmp=map(data, ~invoke_map_dfc(list(mae_improve = mae_vec),
+                                  truth = .x$actual, estimate = .x$forecast))
+  ) %>% 
+  select(-data) %>% 
+  unnest() %>% 
+  ungroup() %>% 
+  add_row(src_sub_area = "all-sub-area",
+          mae_improve = MLmetrics::MAE(scotty_mae_imp$forecast, scotty_mae_imp$actual)) %>% 
+  mutate(
+    mae_improve = round(mae_improve,4)
+  )
+```
+
+#Forecasting Final for `demand` of date Dec-03-2017 until Dec-09-2017
+Since our data train until Nov-25-2017, so we need to add 14 days ahead to do forecasting :
+```{r}
+scotty_forecast <- scotty_model_imp_sel %>% 
+  select(src_sub_area, train, everything(), -test) %>% 
+  mutate(forecast = map(fitted, ~forecast(.x, h = 24*2*7)) %>% 
+                    map2(train, ~tibble(datetime = timetk::tk_make_future_timeseries(.y$datetime, 24*7*2),
+                                        demand = as.vector(.x$mean))))
+  
+```
+
+To restore forecast value to origin value using function `scotty_rec_imp_rev`:
+
+```{r}
+scotty_forecast <- scotty_forecast %>% 
+  select(src_sub_area, actual = train, forecast) %>% 
+  gather(key,value, -src_sub_area) %>% 
+  unnest(value) %>%  
+  mutate(demand = scotty_rec_imp_rev(demand,scotty_rec_imp, src_sub_area))
+```
+
+To see forecast result in plot form :
+```{r}
+scotty_forecast %>% 
+  ggplot(aes(x = datetime, y = demand, colour = key))+
+  geom_line()+
+  labs(x = NULL, y = NULL, colour = NULL)+
+  facet_wrap(~src_sub_area, scale = "free", ncol =1)+
+  theme_light()+
+  tidyquant::scale_colour_tq()
+```
+
+Export data forecast result into CSV with data in range Dec-3-2017 until Dec-9-2017 :
+```{r}
+# total data forecast
+forecast_size <- 24*7
+
+#start and end range for data forecast
+forecast_end <- max(scotty_forecast$datetime)
+forecast_start <- forecast_end - hours(forecast_size) + hours(1)
+
+#interval for data forecast
+inforecast <- interval(forecast_start, forecast_end)
+
+#filter data for interval of forecast data
+scotty_forecast <- scotty_forecast %>% 
+  mutate(type = case_when(
+    datetime %within% inforecast ~ "forecast"
+  )) %>% 
+  filter(
+    type == 'forecast'
+  ) %>% 
+  select(-c(key, type))
+
+# export to CSV file
+write.csv(scotty_forecast, file= "submission-train-data.csv", row.names = FALSE)
+```
+
+# Creating Model using combing data train and data val
+
+Combining data train and data val :
+```{r}
+scotty_combine <- scotty_model_imp_sel %>% 
+  mutate(fulldata = map2(train, test, ~bind_rows(.x,.y))) %>% 
+  select(src_sub_area, fulldata, everything(), -train, -test, -error) %>% 
+  select(-fitted)
+```
+
+# Create Model Based On Full Data
+To run all data in `scotty_combine` to function and model that contained in the data.First step is to run function to create time series data based on var `func` then create new variable `model`and the result will be stored to variable `fitted`:
+```{r}
+scotty_combine <- scotty_combine %>% 
+  mutate(
+    params = map(fulldata, ~list(x=.x)),
+    data = invoke_map(func, params),
+    params = map(data, ~list(x=.x)),
+    fitted = invoke_map(model, params)
+  )
+```
+
+## Forecasting Final (Dec-3-2017 until Dec-9-2017)
+Here we have data until Dec-2-2017 since we have already combined the data train and val. Therefore to do forecasting we need to 7days data ahead :
+```{r}
+scotty_forecast_full <- scotty_combine %>% 
+  mutate(forecast =  map(fitted, ~ forecast(.x, h = 24 * 7)) %>%
+                     map2(fulldata, ~ tibble(datetime = timetk::tk_make_future_timeseries(.y$datetime, 24 * 7),
+                                             demand = as.vector(.x$mean)))
+  )
+```
+
+Restoring forecast value using function `scotty_rec_imp_rev`:
+```{r}
+scotty_forecast_full <- scotty_forecast_full %>% 
+  select(src_sub_area, actual = fulldata, forecast) %>%
+  gather(key, value, -src_sub_area) %>%
+  unnest(value) %>%
+  mutate(demand = scotty_rec_imp_rev(demand, scotty_rec_imp, src_sub_area))
+```
+
+Visualizing forecasting result :
+```{r}
+scotty_forecast_full %>% 
+  ggplot(aes(x=datetime, y= demand, colour = key))+
+    geom_line()+
+    labs(x=NULL, y=NULL, colour= NULL)+
+    facet_wrap(~src_sub_area, scale = "free", ncol=1)+
+    theme_light()+
+    tidyquant::scale_colour_tq()
+```
+Export forecasting data result to to csv for data range Dec-3-2017 - Dec-9-2017 :
+```{r}
+#filter data for forecast type
+scotty_forecast_full <- scotty_forecast_full %>% 
+  filter(key == "forecast") %>% 
+  select(-key)
+
+#export to csv file
+write.csv(scotty_forecast_full, file = "submission-combine-data.csv", row.names = FALSE)
+```
+
+# Assumption Checking
+```{r}
+checkresiduals(scotty_final_model$fitted[[1]], plot = TRUE, main = "Residual from TBATS in Sub-Area sxk97")
+shapir
+```
+
+
+# Summary
+1. Error value based on MAE :
+
+```{r}
+scotty_mae_imp_by_src_sub_area
+```
+2. Based on automated model selection, time series data using patern Complex Seasonality (daily and weekly) produce lower error value than time series data using single seasonality pattern (daily).  
+  
+3. After **data submissions** were sent to **Scorring Dashboard**, model forecasting resulted from *data train * is as followed :  
+
+![](capstone2.jpeg)
+
